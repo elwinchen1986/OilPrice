@@ -99,6 +99,15 @@ class OilPriceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         save_data = dict(self._history_data)
         prices_changed = False
 
+        # Detect if we transitioned to a new adjustment cycle
+        old_adjust_at_str = self._history_data.get("next_adjust_at")
+        new_adjust_at = current_data.get("next_adjust_at")
+        new_adjust_at_str = new_adjust_at.isoformat() if new_adjust_at else ""
+
+        cycle_changed = False
+        if old_adjust_at_str and new_adjust_at_str and old_adjust_at_str != new_adjust_at_str:
+            cycle_changed = True
+
         for key in ("gas92", "gas95", "gas98", "die0"):
             price_text = current_data.get(key)
             if price_text is None:
@@ -113,10 +122,16 @@ class OilPriceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 change_amount = Decimal("0.00")
                 needs_save = True
             elif history_price == new_price:
-                change_amount = _normalize_decimal(self._history_data.get(f"{key}_change"))
-                if change_amount is None:
+                if cycle_changed:
+                    # In a new cycle, if the price remains unchanged (搁浅), the change is 0.00
                     change_amount = Decimal("0.00")
+                    prices_changed = True
                     needs_save = True
+                else:
+                    change_amount = _normalize_decimal(self._history_data.get(f"{key}_change"))
+                    if change_amount is None:
+                        change_amount = Decimal("0.00")
+                        needs_save = True
             else:
                 change_amount = (new_price - history_price).quantize(
                     _TWO_PLACES,
@@ -128,6 +143,10 @@ class OilPriceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             current_data[f"{key}_change"] = float(change_amount)
             save_data[key] = f"{new_price:.2f}"
             save_data[f"{key}_change"] = f"{change_amount:.2f}"
+
+        if new_adjust_at_str != old_adjust_at_str:
+            save_data["next_adjust_at"] = new_adjust_at_str
+            needs_save = True
 
         self._last_prices_changed = prices_changed
         self._history_data = save_data
@@ -184,16 +203,20 @@ class OilPriceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if retry_stale_window:
             # Some upstream pages update prices later than the official 24:00
-            # window. Keep polling briefly so change_amount is calculated from
-            # the old stored price once the page catches up.
-            new_target_time = min(local_now + timedelta(hours=1), next_daily)
+            # window. Keep polling frequently (every 10 minutes) so change_amount 
+            # is calculated from the old stored price once the page catches up.
+            new_target_time = min(local_now + timedelta(minutes=10), next_daily)
         elif self._schedule_mode == SCHEDULE_MODE_DAILY:
             new_target_time = next_daily
         else:
             if adjust_at is None or adjust_at <= local_now:
                 new_target_time = next_daily
             else:
-                new_target_time = adjust_at
+                # Capping the next update at next_daily to ensure a daily check
+                # safeguard, preventing the coordinator from being stuck in a
+                # 14-day sleep if the website updates the next adjust date
+                # text but has not yet updated the price table or if a "搁浅" occurs.
+                new_target_time = min(adjust_at, next_daily)
 
         self._schedule_refresh_at(new_target_time)
 
@@ -202,10 +225,13 @@ class OilPriceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._unsub_tracker = None
         self._scheduled_target_time = None
 
-        try:
-            await self.async_request_refresh()
-        except Exception:
-            _LOGGER.exception("Scheduled oilprice refresh failed")
+        await self.async_request_refresh()
+
+        # If the update failed, _schedule_next_update was never called,
+        # so self._scheduled_target_time remains None. We must schedule a
+        # fallback refresh to prevent the scheduler from dying forever.
+        if self._scheduled_target_time is None:
+            _LOGGER.warning("Scheduled refresh completed without scheduling next update (likely failed), scheduling fallback daily refresh")
             self._schedule_fallback_refresh()
 
     def async_unload(self) -> None:
