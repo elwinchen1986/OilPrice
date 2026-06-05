@@ -102,7 +102,7 @@ class OilPriceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Detect if we transitioned to a new adjustment cycle
         old_adjust_at_str = self._history_data.get("next_adjust_at")
         new_adjust_at = current_data.get("next_adjust_at")
-        new_adjust_at_str = new_adjust_at.isoformat() if new_adjust_at else ""
+        new_adjust_at_str = new_adjust_at.dt.isoformat() if new_adjust_at else ""
 
         cycle_changed = False
         if old_adjust_at_str and new_adjust_at_str and old_adjust_at_str != new_adjust_at_str:
@@ -190,9 +190,8 @@ class OilPriceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         china_tz = dt_util.get_time_zone("Asia/Shanghai") or dt_util.DEFAULT_TIME_ZONE
         local_now = dt_util.now().astimezone(china_tz)
 
-        adjust_at = current_data.get("next_adjust_at")
-        if adjust_at is not None:
-            adjust_at = adjust_at.astimezone(china_tz) + timedelta(minutes=5)
+        adjust_at_result = current_data.get("next_adjust_at")
+        adjust_at = adjust_at_result.dt.astimezone(china_tz) + timedelta(minutes=5) if adjust_at_result is not None else None
 
         retry_stale_window = (
             adjust_at is not None

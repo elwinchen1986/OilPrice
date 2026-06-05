@@ -23,6 +23,14 @@ _HEADERS = {
 _PRICE_VALUE_PATTERN = re.compile(r"(?P<value>\d+\.\d+)(?:\s*元/升)?")
 
 
+class _AdjustAtResult:
+    """Carrier for parsed adjustment datetime + raw-hour flag (hour=24 does not roll over)."""
+    __slots__ = ("dt", "is_hour24")
+    def __init__(self, dt: datetime, is_hour24: bool) -> None:
+        self.dt = dt
+        self.is_hour24 = is_hour24
+
+
 class OilPriceData(TypedDict):
     """Structured payload returned by the upstream parser."""
 
@@ -35,7 +43,7 @@ class OilPriceData(TypedDict):
     tips: str | None
     trend: str | None
     next_adjust_date: str | None
-    next_adjust_at: datetime | None
+    next_adjust_at: Optional[_AdjustAtResult]
     update_time: str
     region: str
     region_name: str
@@ -76,8 +84,8 @@ async def async_fetch_oilprice(hass, region: str) -> OilPriceData:
     gas98 = _to_float_price(_pick_price(table_prices.get("gas98"), parsed_prices.get("gas98")))
     die0 = _to_float_price(_pick_price(table_prices.get("die0"), parsed_prices.get("die0")))
 
-    time_text, tips_text = _extract_notice_fields(soup, normalized_text)
-    trend_text = _extract_trend_text(tips_text)
+    time_text, tips_text, raw_tips_text = _extract_notice_fields(soup, normalized_text)
+    trend_text = _extract_trend_text(raw_tips_text)
     next_adjust_at = _extract_next_adjust_at(time_text)
     next_adjust_date = _format_adjust_datetime(next_adjust_at)
 
@@ -106,15 +114,15 @@ async def async_fetch_oilprice(hass, region: str) -> OilPriceData:
 
 def _extract_notice_fields(
     soup: BeautifulSoup, page_text: str
-) -> Tuple[Optional[str], Optional[str]]:
-    """Extract notice time and tips from huangjinjiage page text."""
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Extract notice time, summarized tips, and raw tips from huangjinjiage page text."""
     page_lines = [_normalize_text(line) for line in soup.stripped_strings]
     page_lines = [line for line in page_lines if line]
 
     time_text = _extract_time_text(page_text)
-    tip_text = _extract_tips_text(page_lines)
+    tip_text, raw_tip_text = _extract_tips_text(page_lines)
 
-    return time_text, tip_text
+    return time_text, tip_text, raw_tip_text
 
 
 def _normalize_text(text: str) -> str:
@@ -304,7 +312,17 @@ def _has_any_core_price(*values: float | None) -> bool:
 
 
 def _extract_time_text(page_text: str) -> Optional[str]:
-    """Extract next adjustment time sentence."""
+    """Extract next adjustment time sentence, from p-tag notice line or page body."""
+    # Top priority: match "下一个油价调整日期" from the top p-tag notice (cleanest source)
+    match = re.search(
+        r"下一个油价调整日期[为:：]?\s*(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2})[点时:]?(\d{2})?",
+        page_text,
+    )
+    if match is not None:
+        year, month, day, hour, minute = match.groups()
+        minute = minute or "00"
+        return f"{year}年{month}月{day}日{int(hour):02d}:{minute}"
+
     match = re.search(r"(油价下次调价时间[为:：]?[^；。\n]+)", page_text)
     if match is not None:
         return match.group(1).strip()
@@ -313,20 +331,56 @@ def _extract_time_text(page_text: str) -> Optional[str]:
     if match is not None:
         return match.group(1).strip()
 
+    match = re.search(r"(本次国内成品油价调整窗口时间为[^；。\n]+)", page_text)
+    if match is not None:
+        return match.group(1).strip()
+
     return None
 
+def _extract_tips_text(page_lines: list[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Extract and summarize latest trend tip text from news lines.
 
-def _extract_tips_text(page_lines: list[str]) -> Optional[str]:
-    """Extract latest trend tip text from news lines."""
+    Returns (summarized_tips, raw_tips).
+    """
+    raw_tips = None
     for line in page_lines:
         if "今日油价最新消息" in line:
-            return line
+            raw_tips = line
+            break
 
-    for line in page_lines:
-        if "油价调整最新消息" in line:
-            return line
+    if raw_tips is None:
+        for line in page_lines:
+            if "油价调整最新消息" in line:
+                raw_tips = line
+                break
 
-    return None
+    if raw_tips is None:
+        return None, None
+
+    return _summarize_tips(raw_tips), raw_tips
+
+
+def _summarize_tips(tips_text: str) -> str:
+    """Summarize tips text to key info: per-grade change amounts + next adjust date."""
+    parts: list[str] = []
+
+    # Extract per-grade change amounts (元/升), e.g. "92号汽油下跌0.42元/升"
+    grade_patterns = (
+        r"92号汽油(?:上涨|下跌|上调|下调|搁浅|不变)[\d.]+元/升",
+        r"95号汽油(?:上涨|下跌|上调|下调|搁浅|不变)[\d.]+元/升",
+        r"98号汽油(?:上涨|下跌|上调|下调|搁浅|不变)[\d.]+元/升",
+        r"0号柴油(?:上涨|下跌|上调|下调|搁浅|不变)[\d.]+元/升",
+    )
+    grade_parts: list[str] = []
+    for pattern in grade_patterns:
+        m = re.search(pattern, tips_text)
+        if m:
+            grade_parts.append(m.group(0))
+
+    if grade_parts:
+        parts.append("，".join(grade_parts))
+
+    return "，".join(parts) if parts else tips_text
 
 
 def _extract_trend_text(tips_text: Optional[str]) -> Optional[str]:
@@ -338,7 +392,7 @@ def _extract_trend_text(tips_text: Optional[str]) -> Optional[str]:
 
     # Highest priority: extract from the pricing-cycle forecast segment.
     cycle_match = re.search(
-        r"新一轮\d+个工作日统计周期[^。；]{0,120}(?:预计|预期|预测)[^。；]{0,20}油价[^。；，]{0,30}(上涨|上调|上升|下调|下跌|下降|搁浅|不作调整|不做调整|维持)",
+        r"新一轮\d+个工作日统计周期[^。；]{0,200}(?:预计|预期|预测)[^。；]{0,30}(?:油价|汽油|柴油)[^。；，]{0,30}(上涨|上调|上升|下调|下跌|下降|搁浅|不作调整|不做调整|维持)",
         normalized,
     )
     if cycle_match is not None:
@@ -349,7 +403,7 @@ def _extract_trend_text(tips_text: Optional[str]) -> Optional[str]:
     # Prefer the explicit forecast wording (e.g. "预计油价上涨...") to avoid
     # being misled by unrelated "国际油价上涨/下跌" context.
     forecast_patterns = (
-        r"(?:预计|预期|预测)[^。；，]{0,20}油价[^。；，]{0,30}(上涨|上调|上升|下调|下跌|下降|搁浅|不作调整|不做调整|维持)",
+        r"(?:预计|预期|预测)[^。；，]{0,30}(?:油价|汽油|柴油)[^。；，]{0,30}(上涨|上调|上升|下调|下跌|下降|搁浅|不作调整|不做调整|维持)",
     )
     for pattern in forecast_patterns:
         match = re.search(pattern, normalized)
@@ -384,8 +438,12 @@ def _normalize_trend_token(token: str) -> Optional[str]:
     return None
 
 
-def _extract_next_adjust_at(time_text: Optional[str]) -> Optional[datetime]:
-    """Extract an aware datetime for the next adjustment window."""
+def _extract_next_adjust_at(time_text: Optional[str]) -> Optional[_AdjustAtResult]:
+    """Extract an aware datetime for the next adjustment window.
+
+    When the source text contains 24:00 / 24点 (common in Chinese oil-price pages),
+    the hour is kept as-is (no date rollover) and the is_hour24 flag is set.
+    """
     if not time_text:
         return None
 
@@ -419,26 +477,34 @@ def _extract_next_adjust_at(time_text: Optional[str]) -> Optional[datetime]:
     hour = int(hour_text)
     minute = int(minute_text)
 
+    # hour == 24 is valid for oil-price pages (e.g. "6月18日24点"), flag it before clamping
+    is_hour24 = hour == 24 and minute == 0
+    if is_hour24:
+        hour, minute = 23, 59
+
+    if hour >= 24 or minute >= 60:
+        return None
+
     try:
         date_obj = datetime(year, month, day, tzinfo=tz)
     except ValueError:
         return None
 
-    if hour == 24 and minute == 0:
-        return date_obj + timedelta(days=1)
-
-    if hour >= 24 or minute >= 60:
-        return None
-
-    return date_obj.replace(hour=hour, minute=minute)
+    return _AdjustAtResult(date_obj.replace(hour=hour, minute=minute), is_hour24)
 
 
-def _format_adjust_datetime(adjust_at: Optional[datetime]) -> Optional[str]:
+def _format_adjust_datetime(adjust_at: Optional[_AdjustAtResult]) -> Optional[str]:
     """Format the next adjustment window for display."""
     if adjust_at is None:
         return None
 
-    local = adjust_at.astimezone(
+    dt = adjust_at.dt
+    is_hour24 = adjust_at.is_hour24
+
+    if is_hour24:
+        return f"{dt.year}年{dt.month}月{dt.day}日24点"
+
+    local = dt.astimezone(
         dt_util.get_time_zone("Asia/Shanghai") or dt_util.DEFAULT_TIME_ZONE
     )
     date_part = f"{local.year}年{local.month}月{local.day}日"
