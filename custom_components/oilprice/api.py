@@ -85,7 +85,7 @@ async def async_fetch_oilprice(hass, region: str) -> OilPriceData:
     die0 = _to_float_price(_pick_price(table_prices.get("die0"), parsed_prices.get("die0")))
 
     time_text, tips_text, raw_tips_text = _extract_notice_fields(soup, normalized_text)
-    trend_text = _extract_trend_text(raw_tips_text)
+    trend_text = _extract_trend_text(raw_tips_text) or "维持"
     next_adjust_at = _extract_next_adjust_at(time_text)
     next_adjust_date = _format_adjust_datetime(next_adjust_at)
 
